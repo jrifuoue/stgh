@@ -1,0 +1,65 @@
+name: "دانلود آفلاین سایت و ذخیره در ریپوزیتوری"
+
+on:
+  workflow_dispatch:
+    inputs:
+      site_url:
+        description: 'آدرس سایت مورد نظر (مثال: https://example.com)'
+        required: true
+        type: string
+        default: 'https://example.com'
+      folder_name:
+        description: 'نام دایرکتوری برای ذخیره سایت (مثال: example-com)'
+        required: true
+        type: string
+        default: 'website-mirror'
+
+jobs:
+  download-website:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: بررسی ریپوزیتوری
+        uses: actions/checkout@v4
+      
+      - name: نصب wget
+        run: sudo apt-get update && sudo apt-get install -y wget
+      
+      - name: دانلود کامل سایت با تمام وابستگی‌ها
+        run: |
+          # ساخت دایرکتوری مقصد با نام وارد شده توسط کاربر
+          mkdir -p "${{ github.workspace }}/${{ github.event.inputs.folder_name }}"
+          
+          # دانلود با wget و تنظیمات Mirror کامل
+          wget \
+            --mirror \
+            --page-requisites \
+            --convert-links \
+            --adjust-extension \
+            --no-parent \
+            --wait=1 \
+            --random-wait \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            -e robots=off \
+            --directory-prefix="${{ github.workspace }}/${{ github.event.inputs.folder_name }}" \
+            "${{ github.event.inputs.site_url }}"
+          
+          echo "✅ دانلود سایت با موفقیت انجام شد"
+          ls -la "${{ github.workspace }}/${{ github.event.inputs.folder_name }}"
+      
+      - name: Commit و Push به ریپوزیتوری
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          
+          # اضافه کردن تمام فایل‌های دانلود شده
+          git add "${{ github.event.inputs.folder_name }}/"
+          
+          # بررسی وجود تغییرات و Commit کردن
+          if git diff --staged --quiet; then
+            echo "⚠️ هیچ تغییر جدیدی یافت نشد"
+          else
+            git commit -m "📥 افزودن آفلاین‌سایت: ${{ github.event.inputs.site_url }} در ${{ github.event.inputs.folder_name }}"
+            git push
+            echo "✅ تغییرات با موفقیت Push شد"
+          fi
