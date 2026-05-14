@@ -1,4 +1,4 @@
-name: "دانلود آفلاین سایت و ذخیره در ریپوزیتوری"
+name: "دانلود فوق‌پیشرفته سایت با پردازش لینک‌ها"
 
 on:
   workflow_dispatch:
@@ -17,20 +17,23 @@ on:
 jobs:
   download-website:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     
     steps:
       - name: بررسی ریپوزیتوری
         uses: actions/checkout@v4
       
-      - name: نصب wget
-        run: sudo apt-get update && sudo apt-get install -y wget
-      
-      - name: دانلود کامل سایت با تمام وابستگی‌ها
+      - name: نصب ابزارهای مورد نیاز
         run: |
-          # ساخت دایرکتوری مقصد با نام وارد شده توسط کاربر
+          sudo apt-get update
+          sudo apt-get install -y wget python3 python3-pip
+          pip3 install beautifulsoup4 lxml
+      
+      - name: دانلود هوشمند سایت (فقط وایت‌لیست)
+        run: |
           mkdir -p "${{ github.workspace }}/${{ github.event.inputs.folder_name }}"
           
-          # دانلود با wget و تنظیمات Mirror کامل
+          # دانلود با wget اما فقط برای انواع فایل‌های مجاز
           wget \
             --mirror \
             --page-requisites \
@@ -39,27 +42,266 @@ jobs:
             --no-parent \
             --wait=1 \
             --random-wait \
+            --reject="exe,msi,zip,rar,7z,tar,gz,bz2,iso,deb,rpm,dmg,pkg,apk,exe,bin,run,sh" \
+            --accept="html,htm,css,js,json,xml,svg,png,jpg,jpeg,gif,webp,ico,ttf,woff,woff2,eot,mp4,webm,mp3" \
             --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
             -e robots=off \
             --directory-prefix="${{ github.workspace }}/${{ github.event.inputs.folder_name }}" \
             "${{ github.event.inputs.site_url }}"
           
-          echo "✅ دانلود سایت با موفقیت انجام شد"
-          ls -la "${{ github.workspace }}/${{ github.event.inputs.folder_name }}"
+          echo "✅ دانلود اولیه با موفقیت انجام شد"
       
-      - name: Commit و Push به ریپوزیتوری
+      - name: پردازش و بازنویسی مسیرها (Path Fixing)
+        run: |
+          cd "${{ github.workspace }}/${{ github.event.inputs.folder_name }}"
+          
+          # پیدا کردن دامنه اصلی از آدرس سایت
+          MAIN_DOMAIN=$(echo "${{ github.event.inputs.site_url }}" | awk -F/ '{print $3}')
+          
+          # ایجاد پوشه deps برای ذخیره وابستگی‌های خارجی
+          mkdir -p "deps/$MAIN_DOMAIN"
+          
+          cat << 'EOF' > /tmp/fix_paths.py
+          import os
+          import re
+          from urllib.parse import urlparse, urljoin
+          from pathlib import Path
+          
+          # تنظیمات
+          MAIN_DOMAIN = os.environ['MAIN_DOMAIN']
+          BASE_DIR = os.environ['GITHUB_WORKSPACE'] + '/' + os.environ['FOLDER_NAME']
+          DEPS_DIR = os.path.join(BASE_DIR, 'deps', MAIN_DOMAIN)
+          
+          # وایت‌لیست پسوندهای قابل پردازش
+          PROCESS_EXTENSIONS = {'.html', '.htm', '.css', '.js', '.json', '.xml', '.svg'}
+          
+          # مجموعه برای ذخیره لینک‌های پردازش شده
+          processed_links = set()
+          
+          def get_relative_path(current_file, target_url):
+              """محاسبه مسیر نسبی از فایل فعلی به فایل هدف"""
+              current_dir = os.path.dirname(current_file)
+              
+              # اگر target_url به دامنه خارجی اشاره دارد
+              parsed_target = urlparse(target_url)
+              if parsed_target.netloc and parsed_target.netloc != MAIN_DOMAIN:
+                  # ذخیره در پوشه deps
+                  external_domain = parsed_target.netloc
+                  local_path = os.path.join(BASE_DIR, 'deps', external_domain, parsed_target.path.lstrip('/'))
+                  if not local_path.endswith(tuple(PROCESS_EXTENSIONS)):
+                      local_path = local_path or 'index.html'
+                  
+                  # محاسبه مسیر نسبی از current_file به local_path
+                  rel_path = os.path.relpath(local_path, current_dir)
+                  return rel_path, local_path
+              
+              # لینک داخلی
+              local_path = os.path.join(BASE_DIR, parsed_target.path.lstrip('/'))
+              if not local_path.endswith(tuple(PROCESS_EXTENSIONS)):
+                  local_path = local_path or 'index.html'
+              
+              rel_path = os.path.relpath(local_path, current_dir)
+              return rel_path, local_path
+          
+          def should_process_file(filepath):
+              """بررسی آیا فایل باید پردازش شود"""
+              ext = os.path.splitext(filepath)[1].lower()
+              return ext in PROCESS_EXTENSIONS
+          
+          def extract_links(content, file_ext):
+              """استخراج لینک‌ها از محتوای فایل بر اساس نوع"""
+              links = []
+              
+              if file_ext in {'.html', '.htm'}:
+                  # لینک‌های HTML
+                  patterns = [
+                      r'(?:href|src|action|data)=["\']([^"\']+)["\']',
+                      r'url\([\'"]?([^)"\']+)[\'"]?\)',
+                      r'@import\s+[\'"]?([^\'")]+)[\'"]?',
+                      r'<link[^>]+href=["\']([^"\']+)["\']',
+                      r'<script[^>]+src=["\']([^"\']+)["\']',
+                      r'<img[^>]+src=["\']([^"\']+)["\']',
+                  ]
+              elif file_ext == '.css':
+                  # لینک‌های CSS
+                  patterns = [
+                      r'url\([\'"]?([^)"\']+)[\'"]?\)',
+                      r'@import\s+[\'"]?([^\'")]+)[\'"]?',
+                  ]
+              elif file_ext == '.js':
+                  # لینک‌های JavaScript
+                  patterns = [
+                      r'["\'](https?://[^"\']+)["\']',
+                      r'load\(["\']([^"\']+)["\']',
+                      r'fetch\(["\']([^"\']+)["\']',
+                  ]
+              else:
+                  return links
+              
+              for pattern in patterns:
+                  matches = re.findall(pattern, content, re.IGNORECASE)
+                  for match in matches:
+                      if match and not match.startswith('#') and not match.startswith('data:'):
+                          # حذف anchor ها
+                          match = match.split('#')[0]
+                          if match:
+                              links.append(match)
+              
+              return list(set(links))
+          
+          def process_file(filepath):
+              """پردازش یک فایل و جایگزینی لینک‌ها"""
+              if not should_process_file(filepath):
+                  return []
+              
+              try:
+                  with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                      content = f.read()
+                  
+                  ext = os.path.splitext(filepath)[1].lower()
+                  links = extract_links(content, ext)
+                  modified = False
+                  
+                  for link in links:
+                      if link in processed_links:
+                          continue
+                      
+                      # تبدیل لینک نسبی به مطلق
+                      absolute_url = urljoin('https://' + MAIN_DOMAIN, link)
+                      rel_path, target_path = get_relative_path(filepath, absolute_url)
+                      
+                      # ذخیره لینک در مجموعه پردازش شده
+                      processed_links.add(link)
+                      
+                      # جایگزینی در محتوا
+                      if link != rel_path:
+                          content = content.replace(link, rel_path)
+                          modified = True
+                          print(f"  جایگزینی: {link} -> {rel_path}")
+                          
+                          # اگر فایل هدف هنوز دانلود نشده و در وایت‌لیست است
+                          if not os.path.exists(target_path) and should_process_file(target_path):
+                              os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                              # علامت‌گذاری برای دانلود بعدی
+                              Path(target_path + '.pending').touch()
+                  
+                  if modified:
+                      with open(filepath, 'w', encoding='utf-8') as f:
+                          f.write(content)
+                      
+                  return [link for link in links if Path(link + '.pending').exists()]
+                  
+              except Exception as e:
+                  print(f"⚠️ خطا در پردازش {filepath}: {e}")
+                  return []
+          
+          # مرحله 1: جمع‌آوری تمام فایل‌ها
+          all_files = []
+          for root, dirs, files in os.walk(BASE_DIR):
+              # نادیده گرفتن پوشه deps در مرحله اول
+              if 'deps' in root and not root.startswith(DEPS_DIR):
+                  continue
+              for file in files:
+                  filepath = os.path.join(root, file)
+                  if should_process_file(filepath):
+                      all_files.append(filepath)
+          
+          # مرحله 2: پردازش تدریجی فایل‌ها
+          print(f"🔍 شروع پردازش {len(all_files)} فایل...")
+          pending_downloads = []
+          
+          for filepath in all_files:
+              print(f"📝 پردازش: {os.path.relpath(filepath, BASE_DIR)}")
+              new_pending = process_file(filepath)
+              pending_downloads.extend(new_pending)
+          
+          # مرحله 3: حذف فایل‌های pending
+          for pending_file in set(pending_downloads):
+              pending_path = pending_file + '.pending'
+              if os.path.exists(pending_path):
+                  os.remove(pending_path)
+          
+          print(f"✅ پردازش مسیرها کامل شد. {len(all_files)} فایل پردازش شدند.")
+          
+          # مرحله 4: ایجاد فایل index.html در روت اگر وجود ندارد
+          if not os.path.exists(os.path.join(BASE_DIR, 'index.html')):
+              with open(os.path.join(BASE_DIR, 'index.html'), 'w', encoding='utf-8') as f:
+                  f.write(f'''<!DOCTYPE html>
+                  <html>
+                  <head><title>آفلاین‌سایت {MAIN_DOMAIN}</title></head>
+                  <body>
+                  <h1>📁 آفلاین‌سایت {MAIN_DOMAIN}</h1>
+                  <p>سایت با موفقیت دانلود و پردازش شد.</p>
+                  <ul>
+                  <li><a href="{os.path.basename(BASE_DIR)}">مشاهده سایت</a></li>
+                  </ul>
+                  </body>
+                  </html>''')
+          
+          # مرحله 5: ایجاد فایل README
+          with open(os.path.join(BASE_DIR, 'README.md'), 'w', encoding='utf-8') as f:
+              f.write(f'''# آفلاین‌سایت {MAIN_DOMAIN}
+
+این ریپوزیتوری شامل یک کپی آفلاین از سایت **{MAIN_DOMAIN}** است.
+
+## 📋 مشخصات
+- **آدرس اصلی:** {os.environ['SITE_URL']}
+- **تاریخ دانلود:** $(date)
+- **نوع محتوا:** HTML, CSS, JS, Images
+- **فایل‌های خارجی:** در پوشه `deps/` ذخیره شده‌اند
+
+## 🚀 نحوه استفاده
+1. فایل `index.html` را در مرورگر خود باز کنید
+2. یا از وب‌سرور محلی استفاده کنید: `python3 -m http.server 8000`
+
+## ⚠️ نکته
+لینک‌های فایل‌های اجرایی (.exe, .msi و غیره) تغییری نکرده‌اند و به همان صورت اصلی باقی می‌مانند.
+''')
+          
+          echo "✅ پردازش نهایی با موفقیت به پایان رسید"
+        env:
+          MAIN_DOMAIN: ${{ github.event.inputs.site_url }}
+          FOLDER_NAME: ${{ github.event.inputs.folder_name }}
+          SITE_URL: ${{ github.event.inputs.site_url }}
+      
+      - name: Commit و Push تغییرات نهایی
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
           
-          # اضافه کردن تمام فایل‌های دانلود شده
+          # اضافه کردن تمام تغییرات
           git add "${{ github.event.inputs.folder_name }}/"
           
-          # بررسی وجود تغییرات و Commit کردن
+          # ایجاد لیست فایل‌های تغییر کرده
+          CHANGED_FILES=$(git diff --staged --name-only)
+          
           if git diff --staged --quiet; then
             echo "⚠️ هیچ تغییر جدیدی یافت نشد"
           else
-            git commit -m "📥 افزودن آفلاین‌سایت: ${{ github.event.inputs.site_url }} در ${{ github.event.inputs.folder_name }}"
+            git commit -m "🔄 آپدیت آفلاین‌سایت: ${{ github.event.inputs.site_url }}
+            
+            فایل‌های تغییر کرده:
+            $CHANGED_FILES"
             git push
+            
+            # نمایش آمار نهایی
             echo "✅ تغییرات با موفقیت Push شد"
+            echo "📊 آمار نهایی:"
+            find "${{ github.event.inputs.folder_name }}" -type f | wc -l | xargs echo "تعداد کل فایل‌ها:"
+            du -sh "${{ github.event.inputs.folder_name }}" | cut -f1 | xargs echo "حجم کل:"
           fi
+      
+      - name: ایجاد Summary نهایی
+        if: always()
+        run: |
+          echo "## 📥 گزارش دانلود" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**آدرس سایت:** ${{ github.event.inputs.site_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**پوشه مقصد:** \`${{ github.event.inputs.folder_name }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**تاریخ:** $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📊 آمار" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          find "${{ github.event.inputs.folder_name }}" -type f | wc -l | xargs echo "تعداد فایل‌ها:" >> $GITHUB_STEP_SUMMARY
+          du -sh "${{ github.event.inputs.folder_name }}" | cut -f1 | xargs echo "حجم کل:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
