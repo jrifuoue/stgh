@@ -1,4 +1,4 @@
-name: "دانلود فوق‌پیشرفته سایت با پردازش لینک‌ها"
+name: "DL"
 
 on:
   workflow_dispatch:
